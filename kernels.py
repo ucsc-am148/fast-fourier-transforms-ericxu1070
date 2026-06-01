@@ -220,17 +220,21 @@ def f2_kernel(
         p_re = tl.gather(reg_re, partner, 0)
         p_im = tl.gather(reg_im, partner, 0)
 
-        # tw * partner (lo uses this)
-        twp_re = tw_re * p_re - tw_im * p_im
-        twp_im = tw_re * p_im + tw_im * p_re
-
-        # tw * self (hi uses this: new_hi = partner - tw * self)
-        tws_re = tw_re * reg_re - tw_im * reg_im
-        tws_im = tw_re * reg_im + tw_im * reg_re
-
         is_hi = (idx & half) != 0
-        reg_re = tl.where(is_hi, p_re - tws_re, reg_re + twp_re)
-        reg_im = tl.where(is_hi, p_im - tws_im, reg_im + twp_im)
+
+        # Both lanes of a pair need the same butterfly term t = tw * v_hi, where
+        # v_hi is the bit-s-set element of the pair (== self on the hi lane,
+        # == partner on the lo lane). Computing t once halves the per-stage
+        # complex multiplies (and live temporaries) vs. forming tw*self and
+        # tw*partner separately -- the spill pressure that dominates large N.
+        hi_re = tl.where(is_hi, reg_re, p_re)
+        hi_im = tl.where(is_hi, reg_im, p_im)
+        t_re = tw_re * hi_re - tw_im * hi_im
+        t_im = tw_re * hi_im + tw_im * hi_re
+
+        # new_lo = v_lo + t (lo lane: self + t), new_hi = v_lo - t (hi lane: partner - t)
+        reg_re = tl.where(is_hi, p_re - t_re, reg_re + t_re)
+        reg_im = tl.where(is_hi, p_im - t_im, reg_im + t_im)
 
     # Optional Bailey twiddle multiply (F2-A: fused into F3 step 2)
     if BAILEY_EPILOGUE:
@@ -257,6 +261,12 @@ def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
     """Grid: (B,). One program per length-N signal. Vanilla mode."""
     B, N = x_re.shape
     LOG2_N = int(math.log2(N))
+    # One program holds the whole length-N signal in registers, so each thread
+    # owns N / (32 * num_warps) elements. The default 4 warps leaves ~128
+    # elements/thread at large N, which spills badly (the kernel's design wall).
+    # Scale warps with N (target ~32 elements/thread) to spread the footprint
+    # across more threads. Small N stays at 4 warps (no benefit from more).
+    num_warps = max(4, min(16, N // 1024))
     f2_kernel[(B,)](
         x_re, x_im, y_re, y_im,
         tw_re, tw_im,
@@ -265,6 +275,7 @@ def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
         1, 0,           # OUTER_DIM, N_TOTAL (unused)
         N=N, LOG2_N=LOG2_N,
         BAILEY_EPILOGUE=False, STRIDED_STORE=False,
+        num_warps=num_warps,
     )
 
 
